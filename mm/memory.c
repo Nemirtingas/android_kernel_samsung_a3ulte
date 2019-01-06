@@ -49,6 +49,7 @@
 #include <linux/rmap.h>
 #include <linux/export.h>
 #include <linux/delayacct.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/writeback.h>
 #include <linux/memcontrol.h>
@@ -59,6 +60,11 @@
 #include <linux/gfp.h>
 #include <linux/migrate.h>
 #include <linux/string.h>
+#include <linux/bug.h>
+
+#ifdef CONFIG_CMA_PINPAGE_MIGRATION
+#include <linux/mm_inline.h>
+#endif
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -710,6 +716,9 @@ static void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
 	if (vma->vm_file && vma->vm_file->f_op)
 		printk(KERN_ALERT "vma->vm_file->f_op->mmap: %pSR\n",
 		       vma->vm_file->f_op->mmap);
+
+	BUG_ON(PANIC_CORRUPTION);
+
 	dump_stack();
 	add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
 }
@@ -820,10 +829,21 @@ out:
  * covered by this vma.
  */
 
+#ifdef CONFIG_TIMA_RKP_L2_GROUP
+static inline unsigned long
+tima_l2group_copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+                pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
+                unsigned long addr, int *rss,
+                tima_l2group_entry_t *tima_l2group_buffer1,
+                tima_l2group_entry_t *tima_l2group_buffer2,
+                unsigned long *tima_l2group_buffer_index,
+                unsigned long tima_l2group_flag)
+#else
 static inline unsigned long
 copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
 		unsigned long addr, int *rss)
+#endif /* CONFIG_TIMA_RKP_L2_GROUP */
 {
 	unsigned long vm_flags = vma->vm_flags;
 	pte_t pte = *src_pte;
@@ -913,6 +933,14 @@ int copy_pte_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	int rss[NR_MM_COUNTERS];
 	swp_entry_t entry = (swp_entry_t){0};
 
+#ifdef CONFIG_TIMA_RKP_L2_GROUP
+        unsigned long tima_l2group_flag = 0;
+        tima_l2group_entry_t *tima_l2group_buffer1 = NULL;
+        tima_l2group_entry_t *tima_l2group_buffer2 = NULL;
+        unsigned long tima_l2group_numb_entries = ((end-addr) >> PAGE_SHIFT);
+        unsigned long tima_l2group_buffer_index = 0;
+#endif
+
 again:
 	init_rss_vec(rss);
 
@@ -925,6 +953,21 @@ again:
 	orig_src_pte = src_pte;
 	orig_dst_pte = dst_pte;
 	arch_enter_lazy_mmu_mode();
+
+#ifdef CONFIG_TIMA_RKP_L2_GROUP
+        /* Re-Initialize all L2_GROUP variables */
+        tima_l2group_flag= 0;
+        tima_l2group_buffer1 = NULL;
+        tima_l2group_buffer2 = NULL;
+        tima_l2group_numb_entries = ((end-addr) >> PAGE_SHIFT);
+        tima_l2group_buffer_index = 0;
+        /*
+         * Lazy mmu mode for tima:
+         */
+        init_tima_rkp_group_buffers(tima_l2group_numb_entries, src_pte,
+                                &tima_l2group_flag, &tima_l2group_buffer_index,
+                                &tima_l2group_buffer1, &tima_l2group_buffer2);
+#endif /* CONFIG_TIMA_RKP_L2_GROUP */
 
 	do {
 		/*
@@ -941,12 +984,43 @@ again:
 			progress++;
 			continue;
 		}
+
+#ifdef CONFIG_TIMA_RKP_L2_GROUP
+                /* function tima_l2group_copy_one_pte() increments
+                 * tima_l2group_buffer_index. Do not increment
+                 * it outside else we end up with buffer sizes
+                 * which are invalid.
+                 */
+                entry.val = tima_l2group_copy_one_pte(dst_mm, src_mm, dst_pte, src_pte,
+                                                        vma, addr, rss,
+                                                        tima_l2group_buffer1,
+                                                        tima_l2group_buffer2,
+                                                        &tima_l2group_buffer_index,
+                                                        tima_l2group_flag);
+#else
 		entry.val = copy_one_pte(dst_mm, src_mm, dst_pte, src_pte,
 							vma, addr, rss);
+#endif /* CONFIG_TIMA_RKP_L2_GROUP */
 		if (entry.val)
 			break;
 		progress += 8;
 	} while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
+
+#ifdef CONFIG_TIMA_RKP_L2_GROUP
+        if (tima_l2group_flag) {
+                /*First: Flush the cache of the buffer to be read by the TZ side
+                 */
+                if(tima_l2group_buffer1)
+                        flush_dcache_page(virt_to_page(tima_l2group_buffer1));
+                if(tima_l2group_buffer2)
+                        flush_dcache_page(virt_to_page(tima_l2group_buffer2));
+
+                /*Second: Pass the buffer pointer and length to TIMA to commit the changes
+                 */
+                write_tima_rkp_group_buffers(tima_l2group_buffer_index,
+                        &tima_l2group_buffer1, &tima_l2group_buffer2);
+        }
+#endif /* CONFIG_TIMA_RKP_L2_GROUP */
 
 	arch_leave_lazy_mmu_mode();
 	spin_unlock(src_ptl);
@@ -1462,6 +1536,80 @@ int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
 }
 EXPORT_SYMBOL_GPL(zap_vma_ptes);
 
+#ifdef CONFIG_CMA_PINPAGE_MIGRATION
+static struct page *__alloc_nonmovable_userpage(struct page *page,
+				unsigned long private, int **result)
+{
+	return alloc_page(GFP_HIGHUSER);
+}
+
+static inline int stack_guard_page(struct vm_area_struct *vma, unsigned long addr);
+
+static bool __need_migrate_cma_page(struct page *page,
+				struct vm_area_struct *vma,
+				unsigned long start, unsigned int flags)
+{
+	if (!(flags & FOLL_CMA))
+		return false;
+
+	if (!(flags & FOLL_GET))
+		return false;
+
+	if (!is_cma_pageblock(page))
+		return false;
+
+	if ((vma->vm_flags & VM_STACK_INCOMPLETE_SETUP) ==
+					VM_STACK_INCOMPLETE_SETUP)
+		return false;
+
+	migrate_prep_local();
+
+	if (!PageLRU(page))
+		return false;
+
+	return true;
+}
+
+static int __migrate_cma_pinpage(struct page *page, struct vm_area_struct *vma)
+{
+	struct zone *zone = page_zone(page);
+	struct list_head migratepages;
+	struct lruvec *lruvec;
+	int tries = 0;
+	int ret = 0;
+
+	INIT_LIST_HEAD(&migratepages);
+
+	if (__isolate_lru_page(page, 0) != 0) {
+		pr_warn("%s: failed to isolate lru page\n", __func__);
+		dump_page(page);
+		return -EFAULT;
+	} else {
+		spin_lock_irq(&zone->lru_lock);
+		lruvec = mem_cgroup_page_lruvec(page, page_zone(page));
+		del_page_from_lru_list(page, lruvec, page_lru(page));
+		spin_unlock_irq(&zone->lru_lock);
+	}
+
+	list_add(&page->lru, &migratepages);
+	inc_zone_page_state(page, NR_ISOLATED_ANON + page_is_file_cache(page));
+
+	while (!list_empty(&migratepages) && tries++ < 5) {
+		ret = migrate_pages(&migratepages,
+			__alloc_nonmovable_userpage, 0, MIGRATE_SYNC, MR_CMA);
+	}
+
+	if (ret < 0) {
+		putback_movable_pages(&migratepages);
+		pr_err("%s: migration failed %p[%#lx]\n", __func__,
+					page, page_to_pfn(page));
+		return -EFAULT;
+	}
+
+	return 0;
+}
+#endif
+
 /**
  * follow_page_mask - look up a page descriptor from a user-virtual address
  * @vma: vm_area_struct mapping @address
@@ -1580,6 +1728,29 @@ split_fallthrough:
 		page = pte_page(pte);
 	}
 
+#ifdef CONFIG_CMA_PINPAGE_MIGRATION
+	if (__need_migrate_cma_page(page, vma, address, flags)) {
+		pte_unmap_unlock(ptep, ptl);
+		if (__migrate_cma_pinpage(page, vma)) {
+			ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+		} else {
+			struct page *old_page = page;
+
+			migration_entry_wait(mm, pmd, address);
+			ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+			update_mmu_cache(vma, address, ptep);
+			pte = *ptep;
+			set_pte_at_notify(mm, address, ptep, pte);
+			page = vm_normal_page(vma, address, pte);
+			BUG_ON(!page);
+
+			pr_debug("cma: cma page %p[%#lx] migrated to new "
+					"page %p[%#lx]\n", old_page,
+					page_to_pfn(old_page),
+					page, page_to_pfn(page));
+		}
+	}
+#endif
 	if (flags & FOLL_GET)
 		get_page_foll(page);
 	if (flags & FOLL_TOUCH) {
@@ -1786,6 +1957,19 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 			pte_unmap(pte);
 			page_mask = 0;
 			goto next_page;
+		}
+
+		if (use_user_accessible_timers()) {
+			if (!vma && in_user_timers_area(mm, start)) {
+				int goto_next_page = 0;
+				int user_timer_ret = get_user_timer_page(vma,
+					mm, start, gup_flags, pages, i,
+					&goto_next_page);
+				if (goto_next_page)
+					goto next_page;
+				else
+					return user_timer_ret;
+			}
 		}
 
 		if (!vma ||
@@ -3021,6 +3205,16 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	entry = pte_to_swp_entry(orig_pte);
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
+#ifdef CONFIG_CMA
+			/*
+			 * FIXME: mszyprow: cruel, brute-force method for
+			 * letting cma/migration to finish it's job without
+			 * stealing the lock migration_entry_wait() and creating
+			 * a live-lock on the faulted page
+			 * (page->_count == 2 migration failure issue)
+			 */
+			mdelay(10);
+#endif
 			migration_entry_wait(mm, pmd, address);
 		} else if (is_hwpoison_entry(entry)) {
 			ret = VM_FAULT_HWPOISON;
@@ -3137,7 +3331,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	mem_cgroup_commit_charge_swapin(page, ptr);
 
 	swap_free(entry);
-	if (vm_swap_full() || (vma->vm_flags & VM_LOCKED) || PageMlocked(page))
+	if ((PageSwapCache(page) && vm_swap_full(page_swap_info(page))) ||
+		(vma->vm_flags & VM_LOCKED) || PageMlocked(page))
 		try_to_free_swap(page);
 	unlock_page(page);
 	if (page != swapcache) {
@@ -4205,7 +4400,7 @@ void print_vma_addr(char *prefix, unsigned long ip)
 	up_read(&mm->mmap_sem);
 }
 
-#ifdef CONFIG_PROVE_LOCKING
+#if defined(CONFIG_PROVE_LOCKING) || defined(CONFIG_DEBUG_ATOMIC_SLEEP)
 void might_fault(void)
 {
 	/*
@@ -4217,13 +4412,17 @@ void might_fault(void)
 	if (segment_eq(get_fs(), KERNEL_DS))
 		return;
 
-	might_sleep();
 	/*
 	 * it would be nicer only to annotate paths which are not under
 	 * pagefault_disable, however that requires a larger audit and
 	 * providing helpers like get_user_atomic.
 	 */
-	if (!in_atomic() && current->mm)
+	if (in_atomic())
+		return;
+
+	__might_sleep(__FILE__, __LINE__, 0);
+
+	if (current->mm)
 		might_lock_read(&current->mm->mmap_sem);
 }
 EXPORT_SYMBOL(might_fault);
