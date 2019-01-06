@@ -25,8 +25,17 @@
 #include <asm/system_misc.h>
 #include <asm/system_info.h>
 #include <asm/tlbflush.h>
+#if defined(CONFIG_ARCH_MSM_SCORPION) && !defined(CONFIG_MSM_SMP)
+#include <asm/io.h>
+#include <mach/msm_iomap.h>
+#endif
+#ifdef  CONFIG_TIMA_RKP
+#include <asm/cp15.h>
+#endif
 
 #include "fault.h"
+
+#include <trace/events/exception.h>
 
 #ifdef CONFIG_MMU
 
@@ -125,6 +134,113 @@ void show_pte(struct mm_struct *mm, unsigned long addr)
 { }
 #endif					/* CONFIG_MMU */
 
+#ifdef  CONFIG_TIMA_RKP
+#ifdef CONFIG_TIMA_RKP_30
+extern unsigned long pgt_bit_array[];
+int tima_is_pg_protected(unsigned long va)
+{
+        unsigned long paddr = __pa(va);
+        unsigned long index = paddr >> PAGE_SHIFT;
+        unsigned long *p = (unsigned long *)pgt_bit_array;
+        unsigned long tmp = index>>5;
+        unsigned long rindex;
+        unsigned long val;
+
+        p += (tmp);
+#ifndef CONFIG_TIMA_RKP_COHERENT_TT
+        asm volatile("mcr     p15, 0, %0, c7, c6, 1\n"
+        "dsb\n"
+        "isb\n"
+        : : "r" (p));
+#endif
+        rindex = index % 32;
+
+        val = (*p) & (1 << rindex)?1:0;
+        return val;
+}
+#else /* CONFIG_TIMA_RKP_30 */
+static DEFINE_RAW_SPINLOCK(par_lock);
+int tima_is_pg_protected(unsigned long va)
+{
+        unsigned long  par;
+        unsigned long flags;
+
+        /* Translate the page use writable priv.
+        Failing means a read-only page
+        (tranlation was confirmed by previous step)*/
+        raw_spin_lock_irqsave(&par_lock, flags);
+        __asm__ __volatile__ (
+                "mcr    p15, 0, %1, c7, c8, 1\n"
+                "dsb\n"
+                "isb\n"
+                "mrc    p15, 0, %0, c7, c4, 0\n"
+                :"=r"(par):"r"(va));
+        raw_spin_unlock_irqrestore(&par_lock, flags);
+        if (par & 0x1) {
+                return 1;
+        }
+
+        return 0;
+}
+#endif /* CONFIG_TIMA_RKP_30 */
+EXPORT_SYMBOL(tima_is_pg_protected);
+
+#define INS_STR_R1      0xe5801000
+#define INS_STR_R3      0xe5a03800
+
+extern void* cpu_v7_set_pte_ext_proc_end;
+
+static unsigned int rkp_fixup(unsigned long addr, struct pt_regs *regs)
+{
+
+        unsigned long inst = *((unsigned long*) regs->ARM_pc);
+        unsigned long reg_val = 0;
+        unsigned long emulate = 0;
+	unsigned long cmd_id = 0x3f808221;
+
+        if (regs->ARM_pc <  (long) cpu_v7_set_pte_ext
+                || regs->ARM_pc > (long) &cpu_v7_set_pte_ext_proc_end) {
+                printk(KERN_ERR
+                        "RKP -> Inst %lx out of cpu_v7_set_pte_ext range from %lx to %lx\n",
+                        (unsigned long) regs->ARM_pc, (long) cpu_v7_set_pte_ext,
+                        (long) &cpu_v7_set_pte_ext_proc_end);
+                return false;
+        }
+        if (inst == INS_STR_R1)
+        {
+                reg_val = regs->ARM_r1;
+                emulate = 1;
+        }
+        else if (inst == INS_STR_R3)
+        {
+                reg_val = regs->ARM_r3;
+                emulate = 1;
+        }
+        if (emulate) {
+                printk(KERN_ERR"Emulating RKP instruction %lx at %p\n",
+                inst, (unsigned long*) regs->ARM_pc);
+#ifndef CONFIG_TIMA_RKP_COHERENT_TT
+                asm volatile("mcr     p15, 0, %0, c7, c14, 1\n"
+                "dsb\n"
+                "isb\n"
+                : : "r" (addr));
+#endif
+                tima_send_cmd5(__pa(addr), reg_val, 0,0,0, cmd_id);
+#ifndef CONFIG_TIMA_RKP_COHERENT_TT
+                asm volatile("mcr     p15, 0, %0, c7, c6, 1\n"
+                "dsb\n"
+                "isb\n"
+                : : "r" (addr));
+#endif
+                regs->ARM_pc += 4;
+                return true;
+        }
+        printk(KERN_ERR"CANNOT Emulate RKP instruction %lx at %p\n",
+                inst, (unsigned long*) regs->ARM_pc);
+        return false;
+}
+#endif /* CONFIG_TIMA_RKP */
+
 /*
  * Oops.  The kernel tried to access some page that wasn't present.
  */
@@ -137,7 +253,13 @@ __do_kernel_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
 	 */
 	if (fixup_exception(regs))
 		return;
-
+#ifdef  CONFIG_TIMA_RKP
+        if (addr >= 0xc0000000 && (fsr & FSR_WRITE)) {
+                if (rkp_fixup(addr, regs)) {
+                        return;
+                }
+        }
+#endif
 	/*
 	 * No handler, we'll have to terminate things with extreme prejudice.
 	 */
@@ -148,6 +270,13 @@ __do_kernel_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
 		"paging request", addr);
 
 	show_pte(mm, addr);
+
+#ifdef CONFIG_TIMA_RKP
+	if (tima_is_pg_protected(addr) == 1)
+		printk(KERN_ERR"RKP ==> Address %lx is RO by RKP\n", addr);
+	tima_send_cmd(addr, 0x3f80e221);
+#endif
+
 	die("Oops", regs, fsr);
 	bust_spinlocks(0);
 	do_exit(SIGKILL);
@@ -163,6 +292,8 @@ __do_user_fault(struct task_struct *tsk, unsigned long addr,
 		struct pt_regs *regs)
 {
 	struct siginfo si;
+
+	trace_user_fault(tsk, addr, fsr);
 
 #ifdef CONFIG_DEBUG_USER
 	if (((user_debug & UDBG_SEGV) && (sig == SIGSEGV)) ||
@@ -261,9 +392,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	struct task_struct *tsk;
 	struct mm_struct *mm;
 	int fault, sig, code;
-	int write = fsr & FSR_WRITE;
-	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
-				(write ? FAULT_FLAG_WRITE : 0);
+	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
 
 	if (notify_page_fault(regs, fsr))
 		return 0;
@@ -276,11 +405,16 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 		local_irq_enable();
 
 	/*
-	 * If we're in an interrupt or have no user
+	 * If we're in an interrupt, or have no irqs, or have no user
 	 * context, we must not take the fault..
 	 */
-	if (in_atomic() || !mm)
+	if (in_atomic() || irqs_disabled() || !mm)
 		goto no_context;
+
+	if (user_mode(regs))
+		flags |= FAULT_FLAG_USER;
+	if (fsr & FSR_WRITE)
+		flags |= FAULT_FLAG_WRITE;
 
 	/*
 	 * As per x86, we may deadlock here.  However, since the kernel only
@@ -349,6 +483,13 @@ retry:
 	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP | VM_FAULT_BADACCESS))))
 		return 0;
 
+	/*
+	 * If we are in kernel mode at this point, we
+	 * have no context to handle this fault with.
+	 */
+	if (!user_mode(regs))
+		goto no_context;
+
 	if (fault & VM_FAULT_OOM) {
 		/*
 		 * We ran out of memory, call the OOM killer, and return to
@@ -358,13 +499,6 @@ retry:
 		pagefault_out_of_memory();
 		return 0;
 	}
-
-	/*
-	 * If we are in kernel mode at this point, we
-	 * have no context to handle this fault with.
-	 */
-	if (!user_mode(regs))
-		goto no_context;
 
 	if (fault & VM_FAULT_SIGBUS) {
 		/*
@@ -507,6 +641,49 @@ do_bad(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	return 1;
 }
 
+#if defined(CONFIG_ARCH_MSM_SCORPION) && !defined(CONFIG_MSM_SMP)
+#define __str(x) #x
+#define MRC(x, v1, v2, v4, v5, v6) do {					\
+	unsigned int __##x;						\
+	asm("mrc " __str(v1) ", " __str(v2) ", %0, " __str(v4) ", "	\
+		__str(v5) ", " __str(v6) "\n" \
+		: "=r" (__##x));					\
+	pr_info("%s: %s = 0x%.8x\n", __func__, #x, __##x);		\
+} while(0)
+
+#define MSM_TCSR_SPARE2 (MSM_TCSR_BASE + 0x60)
+
+#endif
+
+int
+do_imprecise_ext(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+{
+#if defined(CONFIG_ARCH_MSM_SCORPION) && !defined(CONFIG_MSM_SMP)
+	MRC(ADFSR,    p15, 0,  c5, c1, 0);
+	MRC(DFSR,     p15, 0,  c5, c0, 0);
+	MRC(ACTLR,    p15, 0,  c1, c0, 1);
+	MRC(EFSR,     p15, 7, c15, c0, 1);
+	MRC(L2SR,     p15, 3, c15, c1, 0);
+	MRC(L2CR0,    p15, 3, c15, c0, 1);
+	MRC(L2CPUESR, p15, 3, c15, c1, 1);
+	MRC(L2CPUCR,  p15, 3, c15, c0, 2);
+	MRC(SPESR,    p15, 1,  c9, c7, 0);
+	MRC(SPCR,     p15, 0,  c9, c7, 0);
+	MRC(DMACHSR,  p15, 1, c11, c0, 0);
+	MRC(DMACHESR, p15, 1, c11, c0, 1);
+	MRC(DMACHCR,  p15, 0, c11, c0, 2);
+
+	/* clear out EFSR and ADFSR after fault */
+	asm volatile ("mcr p15, 7, %0, c15, c0, 1\n\t"
+		      "mcr p15, 0, %0, c5, c1, 0"
+		      : : "r" (0));
+#endif
+#if defined(CONFIG_ARCH_MSM_SCORPION) && !defined(CONFIG_MSM_SMP)
+	pr_info("%s: TCSR_SPARE2 = 0x%.8x\n", __func__, readl(MSM_TCSR_SPARE2));
+#endif
+	return 1;
+}
+
 struct fsr_info {
 	int	(*fn)(unsigned long addr, unsigned int fsr, struct pt_regs *regs);
 	int	sig;
@@ -546,6 +723,8 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	if (!inf->fn(addr, fsr & ~FSR_LNX_PF, regs))
 		return;
 
+	trace_unhandled_abort(regs, addr, fsr);
+
 	printk(KERN_ALERT "Unhandled fault: %s (0x%03x) at 0x%08lx\n",
 		inf->name, fsr, addr);
 
@@ -577,6 +756,8 @@ do_PrefetchAbort(unsigned long addr, unsigned int ifsr, struct pt_regs *regs)
 
 	if (!inf->fn(addr, ifsr | FSR_LNX_PF, regs))
 		return;
+
+	trace_unhandled_abort(regs, addr, ifsr);
 
 	printk(KERN_ALERT "Unhandled prefetch abort: %s (0x%03x) at 0x%08lx\n",
 		inf->name, ifsr, addr);

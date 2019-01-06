@@ -613,11 +613,21 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 	dump_stack();
 }
 
+#ifdef CONFIG_SLUB_DEBUG_PANIC_ON
+static void slab_panic(const char *cause)
+{
+	panic("%s\n", cause);
+}
+#else
+static inline void slab_panic(const char *cause) {}
+#endif
+
 static void object_err(struct kmem_cache *s, struct page *page,
 			u8 *object, char *reason)
 {
 	slab_bug(s, "%s", reason);
 	print_trailer(s, page, object);
+	slab_panic(reason);
 }
 
 static void slab_err(struct kmem_cache *s, struct page *page, const char *fmt, ...)
@@ -631,6 +641,7 @@ static void slab_err(struct kmem_cache *s, struct page *page, const char *fmt, .
 	slab_bug(s, "%s", buf);
 	print_page_info(page);
 	dump_stack();
+	slab_panic("slab error");
 }
 
 static void init_object(struct kmem_cache *s, void *object, u8 val)
@@ -649,6 +660,7 @@ static void init_object(struct kmem_cache *s, void *object, u8 val)
 static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
 						void *from, void *to)
 {
+	slab_panic("object poison overwritten");
 	slab_fix(s, "Restoring 0x%p-0x%p=0x%x\n", from, to - 1, data);
 	memset(from, data, to - from);
 }
@@ -1376,7 +1388,9 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 	}
 	setup_object(s, page, last);
 	set_freepointer(s, last, NULL);
-
+#ifdef CONFIG_TIMA_RKP_30
+	//tima_send_cmd5(page_to_phys(page), compound_order(page), 1, 0, 0, 0x3f829221);
+#endif
 	page->freelist = start;
 	page->inuse = page->objects;
 	page->frozen = 1;
@@ -1432,6 +1446,9 @@ static void rcu_free_slab(struct rcu_head *h)
 
 static void free_slab(struct kmem_cache *s, struct page *page)
 {
+#ifdef CONFIG_TIMA_RKP_30
+	//tima_send_cmd5(page_to_phys(page), compound_order(page), 0, 0, 0, 0x3f829221);
+#endif
 	if (unlikely(s->flags & SLAB_DESTROY_BY_RCU)) {
 		struct rcu_head *head;
 

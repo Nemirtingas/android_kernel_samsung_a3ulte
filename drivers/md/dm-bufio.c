@@ -604,9 +604,9 @@ static void write_endio(struct bio *bio, int error)
 
 	BUG_ON(!test_bit(B_WRITING, &b->state));
 
-	smp_mb__before_clear_bit();
+	smp_mb__before_atomic();
 	clear_bit(B_WRITING, &b->state);
-	smp_mb__after_clear_bit();
+	smp_mb__after_atomic();
 
 	wake_up_bit(&b->state, B_WRITING);
 }
@@ -973,9 +973,9 @@ static void read_endio(struct bio *bio, int error)
 
 	BUG_ON(!test_bit(B_READING, &b->state));
 
-	smp_mb__before_clear_bit();
+	smp_mb__before_atomic();
 	clear_bit(B_READING, &b->state);
-	smp_mb__after_clear_bit();
+	smp_mb__after_atomic();
 
 	wake_up_bit(&b->state, B_READING);
 }
@@ -1679,8 +1679,8 @@ static int __init dm_bufio_init(void)
 	 * Get the size of vmalloc space the same way as VMALLOC_TOTAL
 	 * in fs/proc/internal.h
 	 */
-	if (mem > (VMALLOC_END - VMALLOC_START) * DM_BUFIO_VMALLOC_PERCENT / 100)
-		mem = (VMALLOC_END - VMALLOC_START) * DM_BUFIO_VMALLOC_PERCENT / 100;
+	if (mem > (VMALLOC_END - VMALLOC_START) / 100 * DM_BUFIO_VMALLOC_PERCENT)
+		mem = (VMALLOC_END - VMALLOC_START) / 100 * DM_BUFIO_VMALLOC_PERCENT ;
 #endif
 
 	dm_bufio_default_cache_size = mem;
